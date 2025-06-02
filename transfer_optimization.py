@@ -1,120 +1,182 @@
+import os
+import csv
+import math
+import datetime
 import numpy as np
-from scipy.integrate import solve_ivp
 
-# ─── MODULE CONSTANTS ─────────────────────────────────────────────────────────
-MU      = 3.986e14        # Earth's gravitational parameter, m^3/s^2
-R_P     = 6578e3          # Initial perigee radius (LEO), m
-R_A     = 42164e3         # Target apogee radius (GEO), m
-T_MAX   = 0.2             # Maximum thrust, N
-I_SP    = 1600            # Specific impulse, s
-G0      = 9.80665         # Standard gravity, m/s^2
-M0      = 500             # Initial spacecraft mass, kg
+# —— physics constants ——
+MU_EARTH    = 3.986e14      # Earth's gravitational parameter, m^3/s^2
+G0          = 9.80665       # standard gravity, m/s^2
 
-# Cost weights
-C_P     = 1000            # Cost per kg propellant ($/kg)
-R_T     = 100             # Cost per second of transfer time ($/s)
+# —— spacecraft parameters ——
+M0          = 1000.0        # kg, initial mass (dry + prop)
+T_THRUST    = 1           # N, constant thrust level
+ISP         = 3000.0        # s, specific impulse
 
-# Numeric settings
-T_MAX_FACTOR = 100        # factor × orbital period to bound max integration time
-NUM_POINTS   = 5000       # points for coast propagation
+# —— mission/economic parameters ——
+CP          = 5000.0        # $ per kg propellant
+R_REVENUE   = 1000.0       # $ per second in GEO
 
-# ─── ORBIT INITIALIZATION ─────────────────────────────────────────────────────
-def init_orbit_parameters():
-    a_initial = 0.5 * (R_P + R_A)
-    T_est = 2 * np.pi * np.sqrt(a_initial**3 / MU)
-    v_perigee = np.sqrt(MU * (2 / R_P - 1 / a_initial))
-    y0 = np.array([R_P, 0.0, 0.0, v_perigee, M0])
-    return a_initial, T_est, y0
+# —— orbit definitions ——
+R_EARTH     = 6371e3        # m, Earth radius
+R_PERIGEE   = R_EARTH + 200e3    # initial perigee altitude, m
+R_APOGEE    = R_EARTH + 35786e3  # GEO apogee altitude, m
+R_GEO       = R_APOGEE           # target circular GEO radius
 
-# ─── EVENT FINDERS ─────────────────────────────────────────────────────────────
-def find_orbit_events(y0, T_est):
-    def coast_odes(t, y):
-        x, y_, vx, vy, _ = y
-        r = np.hypot(x, y_)
-        ax = -MU * x / r**3
-        ay = -MU * y_ / r**3
-        return [vx, vy, ax, ay, 0.0]
+# integration parameters
+dt          = 100           # s, fixed time step for RK4
+max_steps   = int(1e7)       # safety limit on steps
 
-    t_eval = np.linspace(0, T_est, NUM_POINTS)
-    sol = solve_ivp(coast_odes, (0, T_est), y0, t_eval=t_eval, max_step=T_est/NUM_POINTS)
+# golden-section search parameters
+ALPHA_MIN   = 0.1           # min fraction of π for half-angle window
+ALPHA_MAX   = 0.4           # max fraction
+tol         = .1            # convergence tolerance
 
-    r_hist = np.hypot(sol.y[0], sol.y[1])
-    i_peri = np.argmin(r_hist)
-    t_peri = sol.t[i_peri]
+# simulation counter
+sim_counter = 0
 
-    vx_pe, vy_pe = sol.y[2, i_peri], sol.y[3, i_peri]
-    E = 0.5 * (vx_pe**2 + vy_pe**2) - MU / r_hist[i_peri]
-    a_true = -MU / (2 * E)
-    T_true = 2 * np.pi * np.sqrt(a_true**3 / MU)
-    t_apo = t_peri + T_true / 2
-    return t_peri, t_apo, T_true
 
-# ─── PROPAGATION ROUTINES ─────────────────────────────────────────────────────
-def propagate_orbit(y0, thrust_schedule, alpha, r_target, t_max):
-    def full_odes(t, y):
-        x, y_, vx, vy, m = y
-        r = np.hypot(x, y_)
-        ax = -MU * x / r**3
-        ay = -MU * y_ / r**3
-        thrust_on = any(start <= t <= end for start, end in thrust_schedule)
-        if thrust_on and m > 0:
-            ux, uy = x/r, y_/r
-            a_t = alpha * T_MAX / m
-            ax += a_t * ux
-            ay += a_t * uy
-            dm_dt = -alpha * T_MAX / (I_SP * G0)
+def orbital_elements(r, v):
+    r_norm = np.linalg.norm(r)
+    v_norm = np.linalg.norm(v)
+    h_vec = np.cross(r, v)
+    e_vec = (1/MU_EARTH)*((v_norm**2 - MU_EARTH/r_norm)*r - np.dot(r, v)*v)
+    e = np.linalg.norm(e_vec)
+    a = 1.0/(2.0/r_norm - v_norm**2/MU_EARTH)
+    return a, e
+
+
+def thrust_acceleration(r, v, m, half_angle_window):
+    r_norm = np.linalg.norm(r)
+    a_grav = -MU_EARTH * r / r_norm**3
+    theta = math.atan2(r[1], r[0])
+    apogee_angle = math.pi/2
+    delta = abs(theta - apogee_angle)
+    if delta > math.pi:
+        delta = 2*math.pi - delta
+    thrust_on = (delta <= half_angle_window)
+    if thrust_on:
+        v_hat = v / np.linalg.norm(v)
+        a_thrust = (T_THRUST / m) * v_hat
+    else:
+        a_thrust = np.zeros(2)
+    return a_grav + a_thrust, thrust_on
+
+
+def rk4_step(r, v, m, half_angle_window):
+    a1, t1 = thrust_acceleration(r, v, m, half_angle_window)
+    k1_r = v
+    k1_v = a1
+    k1_m = -T_THRUST/(ISP*G0) if t1 else 0.0
+
+    r2 = r + 0.5*dt*k1_r
+    v2 = v + 0.5*dt*k1_v
+    m2 = m + 0.5*dt*k1_m
+    a2, t2 = thrust_acceleration(r2, v2, m2, half_angle_window)
+    k2_r = v2
+    k2_v = a2
+    k2_m = -T_THRUST/(ISP*G0) if t2 else 0.0
+
+    r3 = r + 0.5*dt*k2_r
+    v3 = v + 0.5*dt*k2_v
+    m3 = m + 0.5*dt*k2_m
+    a3, t3 = thrust_acceleration(r3, v3, m3, half_angle_window)
+    k3_r = v3
+    k3_v = a3
+    k3_m = -T_THRUST/(ISP*G0) if t3 else 0.0
+
+    r4 = r + dt*k3_r
+    v4 = v + dt*k3_v
+    m4 = m + dt*k3_m
+    a4, t4 = thrust_acceleration(r4, v4, m4, half_angle_window)
+    k4_r = v4
+    k4_v = a4
+    k4_m = -T_THRUST/(ISP*G0) if t4 else 0.0
+
+    r_new = r + (dt/6.0)*(k1_r + 2*k2_r + 2*k3_r + k4_r)
+    v_new = v + (dt/6.0)*(k1_v + 2*k2_v + 2*k3_v + k4_v)
+    m_new = m + (dt/6.0)*(k1_m + 2*k2_m + 2*k3_m + k4_m)
+    return r_new, v_new, m_new, t1
+
+
+def simulate(half_angle_window, run_dir, optimal=False):
+    global sim_counter
+    sim_counter += 1
+    iteration = sim_counter
+
+    print(f"Starting simulation {iteration}{' (optimal)' if optimal else ''}: half_angle_window={half_angle_window:.4f} rad")
+    csv_path = os.path.join(run_dir, f"trajectory_{iteration}{'_optimal' if optimal else ''}.csv")
+
+    r = np.array([0.0, R_APOGEE])
+    v0 = math.sqrt(MU_EARTH*(2.0/R_APOGEE - 1.0/((R_PERIGEE + R_APOGEE)/2.0)))
+    v = np.array([v0, 0.0])
+    m = M0
+    t = 0.0
+
+    log = []
+    for step in range(max_steps):
+        r, v, m, thrust_flag = rk4_step(r, v, m, half_angle_window)
+        t += dt
+        log.append([t, r[0], r[1], v[0], v[1], int(thrust_flag)])
+
+        a, e = orbital_elements(r, v)
+        rp = a*(1.0 - e)
+        if step % 100000 == 0:
+            print(f"  step {step}, time {t:.1f}s, perigee {rp - R_EARTH:.1f} m above surface")
+        if rp >= R_GEO:
+            print(f"  reached GEO perigee at step {step}, time {t:.1f}s")
+            break
+
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["t","x","y","vx","vy","thrust"])
+        writer.writerows(log)
+
+    mass_used = M0 - m
+    print(f"Simulation {iteration} complete: propellant used={mass_used:.2f} kg, time={t:.1f}s\n")
+    return mass_used, t
+
+
+def cost_function(half_angle_window, run_dir):
+    m, t = simulate(half_angle_window, run_dir)
+    return CP * m + R_REVENUE * t
+
+
+def golden_section_search(func, a, b, tol=1e-3, run_dir=None):
+    invphi = (math.sqrt(5) - 1) / 2
+    invphi2 = (3 - math.sqrt(5)) / 2
+    c = a + invphi2*(b - a)
+    d = a + invphi*(b - a)
+    fc = func(c, run_dir)
+    fd = func(d, run_dir)
+    iter_count = 1
+    print("Starting golden-section search")
+    print(f"Iter {iter_count}: a={a:.4f}, b={b:.4f}, c={c:.4f}, d={d:.4f}, fc={fc:.2f}, fd={fd:.2f}")
+    while abs(b - a) > tol:
+        iter_count += 1
+        if fc < fd:
+            b, d, fd = d, c, fc
+            c = a + invphi2*(b - a)
+            fc = func(c, run_dir)
         else:
-            dm_dt = 0.0
-        return [vx, vy, ax, ay, dm_dt]
+            a, c, fc = c, d, fd
+            d = a + invphi*(b - a)
+            fd = func(d, run_dir)
+        print(f"Iter {iter_count}: a={a:.4f}, b={b:.4f}, c={c:.4f}, d={d:.4f}, fc={fc:.2f}, fd={fd:.2f}")
+    x_opt = (a + b) / 2
+    print(f"Golden-section complete in {iter_count} iterations; x_opt={x_opt:.4f}")
+    return x_opt, func(x_opt, run_dir)
 
-    def reach_radius(t, y):
-        x, y_, *_ = y
-        return np.hypot(x, y_) - r_target
-    reach_radius.terminal = True
-    reach_radius.direction = 1
+if __name__ == "__main__":
+    now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = f"runs/run_{now}"
+    os.makedirs(run_dir, exist_ok=True)
 
-    sol = solve_ivp(
-        full_odes,
-        (0, t_max),
-        y0,
-        events=reach_radius,
-        max_step=t_max/NUM_POINTS
-    )
-    return sol
+    def J(phi_frac, run_dir):
+        half_ang = phi_frac * math.pi
+        return cost_function(half_ang, run_dir)
 
-# ─── COST FUNCTION ─────────────────────────────────────────────────────────────
-def cost_for_alpha(alpha, burn_fraction):
-    """
-    Compute J = C_P*m_prop + R_T*t_final for throttle fraction alpha
-    and burn duration as a fraction of the orbital period.
-    """
-    a_initial, T_est, y0 = init_orbit_parameters()
-    t_peri, t_apo, T_true = find_orbit_events(y0, T_est)
-    burn_duration = burn_fraction * T_true
-    thrust_schedule = [(t_apo, t_apo + burn_duration)]
-    sol = propagate_orbit(y0, thrust_schedule, alpha, R_A, T_true * T_MAX_FACTOR)
-    if not sol.t_events[0].size:
-        return np.inf
-    t_final = sol.t_events[0][0]
-    m_final = sol.y_events[0][0][4]
-    m_prop = M0 - m_final
-    return C_P * m_prop + R_T * t_final
+    phi_opt, J_opt = golden_section_search(J, ALPHA_MIN, ALPHA_MAX, tol, run_dir)
+    print(f"Optimal phi_frac: {phi_opt:.4f}, cost: {J_opt:.2f}")
 
-# ─── OPTIMIZATION ROUTINE ─────────────────────────────────────────────────────
-def optimize_alpha(burn_fraction):
-    # placeholder: return fixed alpha and cost
-    class Result:
-        pass
-    res = Result()
-    res.x = 0.5
-    res.fun = cost_for_alpha(res.x, burn_fraction)
-    return res
-
-# ─── MAIN EXECUTION ───────────────────────────────────────────────────────────
-def main():
-    burn_fraction = 0.5
-    result = optimize_alpha(burn_fraction)
-    print(f"Optimal alpha: {result.x:.3f}, cost: {result.fun:.2f}")
-
-if __name__ == '__main__':
-    main()
+    simulate(phi_opt * math.pi, run_dir, optimal=True)

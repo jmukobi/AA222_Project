@@ -1,3 +1,7 @@
+"""
+This script visualizes the trajectory from the most recent run of transfer_optimization.py.
+"""
+
 import os
 import glob
 import numpy as np
