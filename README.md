@@ -13,7 +13,6 @@ AA222_PROJECT/
 │   │   ├── ...
 │   │   └── trajectory_7_optimal.csv  # Optimal trajectory from golden-section search
 │   └── ...
-├── [Deprecated] transfer_optimization.py  # Old/backup version (no longer used)
 ├── transfer_optimization.py         # Main optimization script
 └── orbit_visualizer.py              # Script to plot the optimal trajectory
 ```
